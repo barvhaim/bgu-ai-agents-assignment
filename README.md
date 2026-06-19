@@ -123,19 +123,3 @@ trace writer are all **provided**.
 uv run python part3/agent.py            # run every goal
 uv run python part3/agent.py --only 3   # re-run just goal 3 (1-based)
 ```
-
-> **Rate limit:** the exchange enforces 12 s between trading calls; the driver
-> already waits 15 s between goals. Never add a tight retry loop.
-
-### Deliverables
-
-| File | What it is |
-|------|-----------|
-| `part3/inspector_worksheet.md` (+ screenshots) | Part 3A — hand-exploration of the MCP |
-| `part3/agent.py` | your `mcp_tools_to_openai` + `dispatch_tool` + `run_agent` |
-| `part3/traces/goal_<N>.json` | one faithful trace per instructor goal |
-| `part3/analysis/evaluation.md` | post-run metrics + failure analysis |
-
-> The grader cross-checks your traces against the exchange's own `get_trades`
-> history — a trace logging a trade that never happened scores zero. The provided
-> `save_trace` keeps them honest by writing exactly what the loop executed.
