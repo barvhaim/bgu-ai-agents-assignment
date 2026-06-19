@@ -1,0 +1,433 @@
+"""
+Part 3 — Wire Your Loop to a LIVE MCP Exchange
+===============================================
+Same loop as Part 2 — and the same two kinds of tools, side by side:
+
+    Part 2:  tools = TOOL_FN dict          (Python functions in your file)
+    Part 3:  tools = ONE MCP server  +  a local TOOL_FN helper
+
+The MCP server is the real competition exchange at agent-stocks.vercel.app.
+Prices are live US-market prices, the leaderboard is shared with every other
+team, and orders move real (pretend) money. Nothing is deterministic anymore —
+so your agent must read what actually happened and never fake a result.
+
+Alongside the exchange your agent also gets one *local* Python tool —
+`pct_change`, a pure compute helper (no network) that reports the percent move
+between two prices. It's the same dict-of-functions you wrote in Part 2; it
+just lives next to the MCP tools in one flat list the model sees. You may ADD
+more local tools (function + TOOL_FN + LOCAL_TOOLS entry).
+
+Three roles, same as always:
+    Ollama (granite4:micro) = the BRAIN   (model provider, text in / text out)
+    MCP exchange + local    = the HANDS   (tools the agent can call)
+    THIS FILE               = the LOOP    (run_agent — the code YOU write)
+
+You implement the same building blocks you would for any MCP agent — the same
+shape as Part 2, plus the MCP twist:
+    TODO 1. mcp_tools_to_openai(mcp_tools)  — translate the server's tool list
+            into the OpenAI-compatible chat-completions tool schema (same shape
+            you wrote by hand in Part 2's TOOLS list). Ollama, OpenAI, vLLM,
+            LiteLLM, etc. all accept this same shape.
+    TODO 2. dispatch_tool(name, args, ...)  — like Part 2's dispatch_tool, but a
+            tool is now EITHER a local Python function (TOOL_FN) OR a remote MCP
+            tool (await client.call_tool). Route each to the right place.
+    TODO 3. run_agent(goal, client)         — the observe -> think -> act loop.
+            It merges BOTH kinds of tools into one list and calls dispatch_tool
+            on each requested tool call.
+
+Everything else — the trading system prompt, the local helper, the goals, the
+goal-driving driver `run_goals`, the trace writer, .env loading — is provided.
+The driver runs each instructor-set GOAL once; for every goal the *model*
+decides what to do, and you submit the trace it produced.
+
+Before you write code, do Part 3A: explore the exchange by hand with the MCP
+Inspector and fill in part3/inspector_worksheet.md. See part3/README.md.
+
+Setup (Part 3B):
+    1. Register your team ON THE WEBSITE (https://agent-stocks.vercel.app) to
+       get your API key. Do NOT register from code.
+    2. Put the key in part3/.env (already in .gitignore):
+           AGENTS_EXCHANGE_API_KEY=ax_your_key_here
+    3. Run:
+           uv run python part3/agent.py            # run every goal
+           uv run python part3/agent.py --only 3   # re-run just goal 3
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import time
+from contextlib import AsyncExitStack
+from pathlib import Path
+
+from openai import OpenAI
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+
+# Ollama speaks the OpenAI chat-completions protocol on localhost:11434/v1.
+_client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+
+MODEL = "granite4:micro"  # pinned: verified to support native tool calling
+MAX_STEPS = 12            # hard stop so a confused model can't loop forever
+
+# The real competition exchange. All tools require your X-API-Key header.
+LIVE_URL = "https://agent-stocks.vercel.app/api/mcp"
+
+# The live exchange rate-limits trading calls (12 s between them). We pace each
+# goal well clear of that — never retry in a tight loop.
+SECONDS_BETWEEN_CYCLES = 15
+
+TRACES_DIR = Path(__file__).parent / "traces"
+
+# The trading policy lives in the system prompt — the MODEL makes the buy/sell/
+# hold call. Tune these rules to shape how your agent behaves.
+SYSTEM_PROMPT = """\
+You are an autonomous trading agent on a live stock exchange. You are given one \
+goal at a time. Inspect the market and your portfolio with the provided tools \
+as needed, then act on the goal, placing AT MOST ONE order.
+
+Tools return cents-based fields (last_cents, cash_cents). Quantities are whole \
+shares. Every trade pays a 0.05% fee, so a buy of qty shares costs about \
+price_cents * qty * 1.0005 — leave headroom for it.
+
+MONEY IS IN CENTS. To show dollars, divide the cents value by 100 and format \
+with two decimals — NEVER print a cents number with a dollar sign. \
+For example: cash_cents 10000000 = $100,000.00; last_cents 57722 = $577.22; \
+last_cents 18500 = $185.00. When a goal asks for dollars, always do this \
+conversion before you answer.
+
+Safety rules you MUST follow:
+- Never overdraw: a buy can't cost more cash than you have (fee included).
+- Only sell shares you actually hold; the exchange rejects short selling.
+- If place_order returns an {"error": ...}, READ it and adapt. Never claim a \
+trade succeeded when it did not.
+
+When you have satisfied the goal, reply with a short plain-text summary of what \
+you did and why, and make no further tool call."""
+
+
+# Tracing — so you can SEE what the agent does, AND save the trajectory.
+# trace() both prints (watch the run live) and records into _TRACE, so the
+# provided save_trace() can write each goal's trace as an agentevals-format
+# message list — exactly like Part 2. You don't touch this; just keep calling
+# trace("action", ...) / trace("observation", ...) from your loop.
+_TRACE: list[dict] = []
+
+
+def trace(step: str, payload) -> None:
+    """Emit one structured trace line and record it for save_trace()."""
+    print(f"  [{step}] {json.dumps(payload, default=str)[:300]}")
+    _TRACE.append({"step": step, "payload": payload})
+
+
+# ---------------------------------------------------------------------------
+# Local tool(s) — the "regular tools" that live alongside the MCP exchange.
+# A local tool is a plain Python function (no network), exactly like Part 2.
+# run_agent merges these into the same flat tool list as the MCP tools, then
+# dispatches them with a direct Python call (no call_tool, no await).
+#
+# Just one is provided: pct_change, a price-move helper. Add more of your own by
+# writing the function, registering it in TOOL_FN, and describing it in
+# LOCAL_TOOLS — the same two-step you did in Part 2.
+# ---------------------------------------------------------------------------
+def pct_change(old_cents: int, new_cents: int) -> dict:
+    """
+    Percent change from old_cents to new_cents (e.g. 100 -> 110 is +10.0).
+    Read-only math the model can use to judge a price move.
+    """
+    if not old_cents:
+        return {"error": "old_cents must be non-zero"}
+    return {"pct": round((new_cents - old_cents) / old_cents * 100, 2)}
+
+
+# Local tool registry — name -> Python function. The "billboard" the model
+# reads is LOCAL_TOOLS (the JSON schema); dispatch happens through TOOL_FN.
+TOOL_FN: dict = {
+    "pct_change": pct_change,
+    # Add more local tools here (and a matching LOCAL_TOOLS entry below).
+}
+
+LOCAL_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "pct_change",
+            "description": "Percent change between two cents prices (from old_cents to new_cents). Use to judge how far a price has moved; read-only, places no order.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_cents": {"type": "integer", "description": "earlier price in cents"},
+                    "new_cents": {"type": "integer", "description": "later price in cents"},
+                },
+                "required": ["old_cents", "new_cents"],
+            },
+        },
+    },
+    # Add more local tool schemas here.
+]
+
+
+# ---------------------------------------------------------------------------
+# TODO 1 — mcp_tools_to_openai
+# ---------------------------------------------------------------------------
+def mcp_tools_to_openai(mcp_tools) -> list[dict]:
+    """
+    Translate the tool definitions returned by client.list_tools() into the
+    OpenAI-compatible chat-completions tool schema (what
+    _client.chat.completions.create(tools=...) expects). Ollama, OpenAI, vLLM,
+    LiteLLM, etc. all accept this same shape.
+
+    Each MCP tool object has:
+        .name        (str)
+        .description (str or None)
+        .inputSchema (dict — already a valid JSON Schema, or None)
+
+    Each tool entry must look like:
+        {
+            "type": "function",
+            "function": {
+                "name": ...,
+                "description": ...,
+                "parameters": ...,   # the inputSchema, or {"type":"object","properties":{}}
+            }
+        }
+
+    Hint: this is the same shape you wrote by hand in Part 2's TOOLS list.
+    """
+    # TODO: implement this function
+    raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# TODO 2 — dispatch_tool  (Part 2's dispatch, extended for MCP)
+# ---------------------------------------------------------------------------
+async def dispatch_tool(name: str, args: dict, client: Client, mcp_names: set):
+    """
+    Route ONE tool call to where the tool actually lives, and return its result
+    (or {"error": ...} on failure). This is Part 2's dispatch_tool, extended:
+    a tool is now EITHER a local Python function OR a remote MCP tool.
+
+      - if name in TOOL_FN:   a plain Python call,  TOOL_FN[name](**args)
+      - elif name in mcp_names: result = await client.call_tool(name, dict(args))
+                                then return result.data  (NOT a plain value —
+                                MCP wraps the payload in .data)
+      - else:                 an unknown tool — return an {"error": ...} dict
+
+    `mcp_names` is the set of names the MCP server advertised, built in run_agent
+    from client.list_tools(), so you can tell a local tool from an MCP tool.
+    Returning {"error": ...} (instead of raising) keeps a bad call as a normal
+    observation the model can read and adapt to — just like Part 2.
+    """
+    # TODO: implement this function
+    raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# TODO 3 — run_agent  (the loop — identical to Part 2 except dispatch)
+# ---------------------------------------------------------------------------
+async def run_agent(goal: str, client: Client) -> tuple[str, list[dict]]:
+    """
+    Drive one goal to completion. Returns (final_answer, tool_log).
+
+    client: a single ALREADY-OPEN MCP client (the exchange). The tools the model
+    sees are the LOCAL_TOOLS plus the MCP server's tools, merged into one flat
+    list. dispatch_tool routes each call to its local function or to the MCP
+    client. main()/run_goals() owns the session lifecycle — run_agent never opens
+    or closes the client.
+
+    Steps:
+      1. Get the MCP tools with `await client.list_tools()`. Build:
+           - `tools`: the flat OpenAI-format list. Combine the local schemas
+             with the translated MCP ones:  LOCAL_TOOLS + mcp_tools_to_openai(...)
+           - `mcp_names`: a set of the MCP tool names, so dispatch_tool can tell
+             local tools from MCP ones. Pass it (and `client`) to dispatch_tool.
+      2. Run the same observe -> think -> act loop as Part 2. For each tool call:
+           observation = await dispatch_tool(name, args, client, mcp_names)
+      3. Record every executed call into `tool_log` as
+           {"tool": name, "args": args, "result": observation}
+         and return it alongside the final answer, so the driver can write a
+         faithful trace of the goal.
+
+    The rest — messages, the chat completion call, appending observations as
+    tool-role messages with their tool_call_id — is identical to Part 2.
+    """
+    # TODO: implement this function
+    raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# The goals — the instructor sets these; the agent runs each one once and you
+# submit the trace it produces. Add your own goals at the end to exercise more
+# of the agent; the driver runs every goal in this list.
+# (Provided — you do not need to change this, though you may add goals.)
+# ---------------------------------------------------------------------------
+GOALS = [
+    # 1. Read-only: report the portfolio.
+    "Report your current portfolio: your cash in dollars and every position"
+    " you hold.",
+
+    # 2. Read-only: survey the market.
+    "Survey the market: list the available symbols with their current prices,"
+    " and tell me which one is the most expensive and which is the cheapest.",
+
+    # 3. Read-only + local tool: compare two symbols by price.
+    "Compare AAPL and MSFT: quote both and use pct_change to say how far"
+    " MSFT's price is above or below AAPL's. Do not trade.",
+
+    # 4. Read-only: summarize the latest news.
+    "Read the latest news and summarize, in one line each, the three most"
+    " recent headlines and which symbol each is about.",
+
+    # 5. Trade: a news-driven buy, sized conservatively.
+    "Buy the stock with the most supportive recent news. Spend at most 30% of"
+    " your net worth on it and keep at least 20% of your portfolio in cash."
+    " Place the order and confirm the fill from the result.",
+
+    # 6. Trade: prune holdings that no longer have supporting news.
+    "Review your holdings and sell any position you can no longer justify from"
+    " recent news. If every holding is still justified, hold and explain why.",
+
+    # 7. Read-only: where do we stand against everyone else.
+    "Check the leaderboard and tell me our team's rank and net worth relative"
+    " to the other teams. Do not trade.",
+]
+
+
+# ---------------------------------------------------------------------------
+# Trace logging — the DRIVER owns this, not the model. One file per goal.
+# These files are your evidence; the grader cross-checks them against the
+# exchange's get_trades history, so they must reflect what really happened.
+# Same agentevals format as Part 2: a flat list of OpenAI-format chat messages.
+# (Provided — you do not need to change this.)
+# ---------------------------------------------------------------------------
+def save_trace(goal_num: int, goal: str, answer: str) -> Path:
+    """
+    Write the trajectory recorded in _TRACE for one goal to
+    part3/traces/goal_<N>.json, as a flat list of OpenAI-format chat messages.
+
+    This is the shape LangChain's `agentevals` expects for trajectory match
+    evaluators (https://github.com/langchain-ai/agentevals) — identical to
+    Part 2's task_<N>.json: each tool call is an assistant message with a
+    `tool_calls` entry whose `arguments` is a JSON string, followed by a
+    `tool`-role message holding the result. Returns the path.
+    """
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": goal},
+    ]
+    for entry in _TRACE:
+        if entry["step"] == "action":
+            call = entry["payload"]  # {"tool": name, "args": {...}}
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": call.get("tool"),
+                                "arguments": json.dumps(call.get("args", {}), default=str),
+                            }
+                        }
+                    ],
+                }
+            )
+        elif entry["step"] == "observation":
+            messages.append(
+                {"role": "tool", "content": json.dumps(entry["payload"], default=str)}
+            )
+    # the model's final natural-language answer (no tool call)
+    messages.append({"role": "assistant", "content": answer})
+
+    TRACES_DIR.mkdir(parents=True, exist_ok=True)
+    path = TRACES_DIR / f"goal_{goal_num}.json"
+    path.write_text(json.dumps(messages, indent=2, default=str))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# run_goals — the outer driver. Deterministic Python around the LLM loop, the
+# Part 3 twin of Part 2's run_task loop: for each goal, clear the trace, run the
+# agent, save the trace. The only Part-3 additions are the shared MCP session
+# (opened once, since there is no sandbox to reset) and the rate-limit sleep the
+# live exchange requires. The saved traces are what you submit.
+# (Provided — you do not need to change this, though you may add goals.)
+# ---------------------------------------------------------------------------
+async def run_goals(api_key: str, goals: list[str]) -> None:
+    """
+    Run each goal in `goals` once against the live exchange. For each goal:
+      1. clear _TRACE (fresh trajectory — the MCP analog of resetting Part 2's
+         sandbox; the live exchange has no sandbox to reset);
+      2. run_agent() lets the model inspect the market and act on the goal;
+      3. write part3/traces/goal_<N>.json;
+      4. sleep SECONDS_BETWEEN_CYCLES to stay clear of the rate limit.
+    """
+    async with AsyncExitStack() as stack:
+        exchange = await stack.enter_async_context(make_live_client(api_key))
+
+        for i, goal in enumerate(goals, 1):
+            print(f"\n{'='*60}\nGOAL {i}/{len(goals)}: {goal}\n{'='*60}")
+            _TRACE.clear()  # fresh trajectory per goal (no sandbox to reset)
+            try:
+                answer, _tool_log = await run_agent(goal, exchange)
+            except NotImplementedError:
+                raise
+            except Exception as e:  # never let one bad goal kill the run
+                print(f"  [goal-error] {e!r}")
+                answer = f"(goal errored: {e})"
+
+            path = save_trace(i, goal, answer)
+            print(f"\n--- ANSWER: {answer}")
+            print(f"--- trace saved to {path}")
+
+            if i < len(goals):
+                time.sleep(SECONDS_BETWEEN_CYCLES)
+
+
+# ---------------------------------------------------------------------------
+# Client factory
+# ---------------------------------------------------------------------------
+def make_live_client(api_key: str) -> Client:
+    """Connect to the real competition exchange with your API key header."""
+    return Client(
+        StreamableHttpTransport(url=LIVE_URL, headers={"X-API-Key": api_key})
+    )
+
+
+def load_api_key() -> str:
+    """Read AGENTS_EXCHANGE_API_KEY from the environment or part3/.env."""
+    api_key = os.environ.get("AGENTS_EXCHANGE_API_KEY", "")
+    if not api_key:
+        env_file = Path(__file__).parent / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("AGENTS_EXCHANGE_API_KEY="):
+                    api_key = line.split("=", 1)[1].strip()
+    return api_key
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="Live MCP trading agent")
+    parser.add_argument("--only", type=int, default=None, metavar="N",
+                        help="run only goal N (1-based) instead of all goals")
+    args = parser.parse_args()
+
+    api_key = load_api_key()
+    if not api_key:
+        print("ERROR: set AGENTS_EXCHANGE_API_KEY in your environment or part3/.env")
+        print("       (register your team on https://agent-stocks.vercel.app to get a key)")
+        return
+
+    goals = GOALS
+    if args.only is not None:
+        if not 1 <= args.only <= len(GOALS):
+            print(f"ERROR: --only must be between 1 and {len(GOALS)}")
+            return
+        goals = [GOALS[args.only - 1]]
+
+    await run_goals(api_key, goals)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
