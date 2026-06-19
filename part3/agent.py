@@ -354,9 +354,11 @@ def save_trace(goal_num: int, goal: str, answer: str) -> Path:
 # live exchange requires. The saved traces are what you submit.
 # (Provided — you do not need to change this, though you may add goals.)
 # ---------------------------------------------------------------------------
-async def run_goals(api_key: str, goals: list[str]) -> None:
+async def run_goals(api_key: str, goals: list[tuple[int, str]]) -> None:
     """
-    Run each goal in `goals` once against the live exchange. For each goal:
+    Run each goal in `goals` once against the live exchange. `goals` is a list
+    of (goal_num, goal_text) pairs — goal_num is the 1-based position in GOALS,
+    so the saved filename matches the goal even with --only N. For each goal:
       1. clear _TRACE (fresh trajectory — the MCP analog of resetting Part 2's
          sandbox; the live exchange has no sandbox to reset);
       2. run_agent() lets the model inspect the market and act on the goal;
@@ -366,8 +368,8 @@ async def run_goals(api_key: str, goals: list[str]) -> None:
     async with AsyncExitStack() as stack:
         exchange = await stack.enter_async_context(make_live_client(api_key))
 
-        for i, goal in enumerate(goals, 1):
-            print(f"\n{'='*60}\nGOAL {i}/{len(goals)}: {goal}\n{'='*60}")
+        for idx, (num, goal) in enumerate(goals):
+            print(f"\n{'='*60}\nGOAL {num}: {goal}\n{'='*60}")
             _TRACE.clear()  # fresh trajectory per goal (no sandbox to reset)
             try:
                 answer, _tool_log = await run_agent(goal, exchange)
@@ -377,11 +379,11 @@ async def run_goals(api_key: str, goals: list[str]) -> None:
                 print(f"  [goal-error] {e!r}")
                 answer = f"(goal errored: {e})"
 
-            path = save_trace(i, goal, answer)
+            path = save_trace(num, goal, answer)
             print(f"\n--- ANSWER: {answer}")
             print(f"--- trace saved to {path}")
 
-            if i < len(goals):
+            if idx < len(goals) - 1:
                 time.sleep(SECONDS_BETWEEN_CYCLES)
 
 
@@ -419,12 +421,14 @@ async def main():
         print("       (register your team on https://agent-stocks.vercel.app to get a key)")
         return
 
-    goals = GOALS
+    # (goal_num, goal_text) pairs — goal_num is the 1-based position in GOALS so
+    # the trace filename matches the goal even when running a single --only goal.
+    goals = list(enumerate(GOALS, 1))
     if args.only is not None:
         if not 1 <= args.only <= len(GOALS):
             print(f"ERROR: --only must be between 1 and {len(GOALS)}")
             return
-        goals = [GOALS[args.only - 1]]
+        goals = [(args.only, GOALS[args.only - 1])]
 
     await run_goals(api_key, goals)
 
