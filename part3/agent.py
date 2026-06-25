@@ -41,7 +41,7 @@ The driver runs each instructor-set GOAL once; for every goal the *model*
 decides what to do, and you submit the trace it produced.
 
 Before you write code, do Part 3A: explore the exchange by hand with the MCP
-Inspector and fill in part3/inspector_worksheet.md. See part3/README.md.
+Inspector
 
 Setup (Part 3B):
     1. Register your team ON THE WEBSITE (https://agent-stocks.vercel.app) to
